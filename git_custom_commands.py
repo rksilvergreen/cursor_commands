@@ -11,8 +11,9 @@ Higher-level Git workflows that build on `git_commands.py`.
     with a caller-supplied message, and push to the remote.
 
 `git_merge_to_main`
-    Mirrors the behavior described in `git-merge-to-main.md`: merge the
-    current branch into main with ``--no-ff``, tag the release, and push.
+    Mirrors the behavior described in `git-merge-to-main.md`: optionally run a
+    release-preparation hook, merge the current branch into main with
+    ``--no-ff``, tag the release, and push.
 
 GitHub MCP (Cursor) cannot be invoked from plain Python; use `gh` or add the
 remote yourself when the CLI is unavailable.
@@ -27,7 +28,7 @@ import sys
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import List, Literal, Optional, Union
+from typing import Callable, List, Literal, Optional, Union
 
 StrPath = Union[str, Path]
 
@@ -105,6 +106,7 @@ class GitMergeToMainResult:
     tag: str
     merge_commit_hash: Optional[str] = None
     pre_merge_commit_hash: Optional[str] = None
+    release_commit_hash: Optional[str] = None
     pushed: bool = False
     remote_url: Optional[str] = None
     warnings: List[str] = field(default_factory=list)
@@ -580,6 +582,8 @@ def git_merge_to_main(
     tag_prefix: str = "v",
     commit_uncommitted: bool = True,
     pre_merge_commit_message: Optional[str] = None,
+    prepare_release: Optional[Callable[[Path, str], None]] = None,
+    release_commit_message: Optional[str] = None,
     merge_commit_message: Optional[str] = None,
     tag_message: Optional[str] = None,
     push: bool = True,
@@ -609,6 +613,16 @@ def git_merge_to_main(
     pre_merge_commit_message :
         Commit message for uncommitted changes.  Default:
         ``"chore: Prepare release {version}"``.
+    prepare_release :
+        Optional callable invoked on the source branch after initial changes
+        are committed and pushed but before the merge into main.  Receives
+        ``(repo_root: Path, version: str)`` and is expected to make
+        release-preparation changes (version bumps, changelog updates, etc.).
+        Any resulting modifications are staged, committed, and pushed
+        automatically.
+    release_commit_message :
+        Commit message for changes produced by ``prepare_release``.  Default:
+        ``"chore: Bump version to {version}"``.
     merge_commit_message :
         Message for the ``--no-ff`` merge commit.  Default:
         ``"chore: Release version {version}"``.
@@ -683,6 +697,40 @@ def git_merge_to_main(
             warnings.append(w)
             if strict_push:
                 raise GitMergeToMainError(w) from exc
+
+    # --- run release preparation hook ---
+    release_hash: Optional[str] = None
+    if prepare_release is not None:
+        prepare_release(repo_root, version)
+        if _has_uncommitted_changes(repo_root):
+            r_msg = release_commit_message or f"chore: Bump version to {version}"
+            gc.git_add(all=True, cwd=str(repo_root))
+            try:
+                gc.git_commit(
+                    message=r_msg, cwd=str(repo_root), check=True, capture_output=True,
+                )
+            except subprocess.CalledProcessError as exc:
+                raise GitMergeToMainError(
+                    f"Release commit failed (exit {exc.returncode}): "
+                    f"{(exc.stderr or exc.stdout or '').strip() or 'no output'}"
+                ) from exc
+            release_hash = _commit_hash(repo_root)
+            if push:
+                try:
+                    gc.git_push(
+                        remote_name, source_branch,
+                        cwd=str(repo_root), check=True, capture_output=True,
+                    )
+                except subprocess.CalledProcessError as exc:
+                    err = (exc.stderr or exc.stdout or "").strip()
+                    w = f"Release-commit push failed (exit {exc.returncode}): {err or 'no output'}"
+                    warnings.append(w)
+                    if strict_push:
+                        raise GitMergeToMainError(w) from exc
+        else:
+            warnings.append(
+                "prepare_release hook ran but produced no changes to commit."
+            )
 
     # --- checkout main ---
     try:
@@ -788,6 +836,7 @@ def git_merge_to_main(
         tag=tag_name,
         merge_commit_hash=merge_hash,
         pre_merge_commit_hash=pre_merge_hash,
+        release_commit_hash=release_hash,
         pushed=pushed,
         remote_url=remote_url,
         warnings=warnings,
