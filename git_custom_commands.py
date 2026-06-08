@@ -1043,13 +1043,22 @@ def git_reinit(
         )
     commit_hash = _commit_hash(repo_root)
 
-    # Remove every other local branch, then name the orphan `main` and branch
-    # `develop` from it.
+    # Remove every other local branch and all local tags, then name the orphan
+    # `main` and branch `develop` from it.
     for br in _local_branches(repo_root):
         if br == tmp_branch:
             continue
         gc.git_branch(
             force_delete=br, cwd=str(repo_root), check=False, capture_output=True,
+        )
+    local_tags_result = gc.run_git(
+        "tag", "--list",
+        cwd=str(repo_root), capture_output=True, text=True, check=False,
+    )
+    for tg in filter(None, local_tags_result.stdout.splitlines()):
+        gc.run_git(
+            "tag", "-d", tg.strip(),
+            cwd=str(repo_root), capture_output=True, text=True, check=False,
         )
     gc.git_branch(move=main_branch, cwd=str(repo_root), check=True, capture_output=True)
     gc.git_branch(develop_branch, cwd=str(repo_root), check=True, capture_output=True)

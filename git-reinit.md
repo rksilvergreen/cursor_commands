@@ -7,7 +7,7 @@ Use this command to collapse an existing repo's entire history into a single fre
 This command is destructive, so do not run it immediately. When the user invokes it, first respond with a brief confirmation request that states the repercussions concisely:
 
 - The entire commit history is rewritten into a single commit. The old history is **not** backed up — once the rewrite is pushed and garbage-collected, it is gone.
-- The remote is overwritten with a force-push, and every other remote branch and all remote tags are deleted.
+- All local tags are deleted and the remote is overwritten with a force-push; every other remote branch and all remote tags are also removed.
 - Anyone else using the repo must re-clone.
 
 Then ask whether they are sure they want to proceed. Only run **`git_reinit`** after the user explicitly confirms; if they decline or do not clearly confirm, do not run it.
@@ -26,7 +26,7 @@ Unless the user explicitly specifies an argument, leave it out and let **`git_re
 
 ## What it does
 
-Rewrites history in place using an orphan branch — it never moves or deletes `.git`. It creates an orphan branch, stages the current working tree (including submodule gitlinks), and commits it as a single commit. It then deletes every other local branch, renames the orphan to `main`, creates `develop` from it, and checks out `develop`. If a remote is configured, `main` and `develop` are force-pushed (with `--force-with-lease` by default); with `prune_remote` it then deletes every other remote branch and all remote tags so the remote mirrors the clean state. The old history is not preserved — there is no backup.
+Rewrites history in place using an orphan branch — it never moves or deletes `.git`. It creates an orphan branch, stages the current working tree (including submodule gitlinks), and commits it as a single commit. It then deletes every other local branch and all local tags, renames the orphan to `main`, creates `develop` from it, and checks out `develop`. If a remote is configured, `main` and `develop` are force-pushed (with `--force-with-lease` by default); with `prune_remote` it then deletes every other remote branch and all remote tags so the remote mirrors the clean state. Deleting local tags is essential — without it, old commits remain reachable via tag refs and are not garbage-collected. The old history is not preserved — there is no backup.
 
 ## Submodules
 
