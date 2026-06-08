@@ -62,6 +62,10 @@ class GitMergeToMainError(GitWorkflowError):
     """Raised for hard failures during merge-to-main."""
 
 
+class GitReinitError(GitWorkflowError):
+    """Raised for hard failures during history reinitialization."""
+
+
 @dataclass
 class GitInitResult:
     """Outcome of `git_init`."""
@@ -109,6 +113,23 @@ class GitMergeToMainResult:
     release_commit_hash: Optional[str] = None
     pushed: bool = False
     remote_url: Optional[str] = None
+    warnings: List[str] = field(default_factory=list)
+
+
+@dataclass
+class GitReinitResult:
+    """Outcome of `git_reinit`."""
+
+    success: bool
+    repository_root: Path
+    current_branch: str
+    main_branch: str
+    develop_branch: str
+    commit_hash: Optional[str] = None
+    remote_url: Optional[str] = None
+    pushed: bool = False
+    deleted_remote_branches: List[str] = field(default_factory=list)
+    deleted_remote_tags: List[str] = field(default_factory=list)
     warnings: List[str] = field(default_factory=list)
 
 
@@ -843,6 +864,268 @@ def git_merge_to_main(
     )
 
 
+def _list_remote_refs(
+    repo_root: Path, remote_name: str, kind: str
+) -> Optional[List[str]]:
+    """Return remote branch or tag short-names (kind = "heads" | "tags"), or
+    None if the remote could not be reached."""
+    r = gc.run_git(
+        "ls-remote", f"--{kind}", remote_name,
+        cwd=str(repo_root), capture_output=True, text=True, check=False,
+    )
+    if r.returncode != 0:
+        return None
+    prefix = f"refs/{kind}/"
+    names: List[str] = []
+    for line in r.stdout.splitlines():
+        parts = line.split("\t")
+        if len(parts) != 2:
+            continue
+        ref = parts[1].strip()
+        if ref.startswith(prefix):
+            name = ref[len(prefix):]
+            if kind == "tags" and name.endswith("^{}"):  # skip peeled tags
+                continue
+            names.append(name)
+    return names
+
+
+def _local_branches(repo_root: Path) -> List[str]:
+    r = gc.run_git(
+        "branch", "--format=%(refname:short)",
+        cwd=str(repo_root), capture_output=True, text=True, check=False,
+    )
+    if r.returncode != 0:
+        return []
+    return [ln.strip() for ln in r.stdout.splitlines() if ln.strip()]
+
+
+def _submodule_paths(repo_root: Path) -> List[str]:
+    r = gc.run_git(
+        "submodule", "status",
+        cwd=str(repo_root), capture_output=True, text=True, check=False,
+    )
+    if r.returncode != 0 or not r.stdout.strip():
+        return []
+    paths: List[str] = []
+    for ln in r.stdout.splitlines():
+        if not ln.strip():
+            continue
+        body = ln[1:].strip() if ln[:1] in (" ", "+", "-", "U") else ln.strip()
+        parts = body.split()
+        if len(parts) >= 2:
+            paths.append(parts[1])
+    return paths
+
+
+def _dirty_submodules(repo_root: Path) -> List[str]:
+    """Submodule paths that have uncommitted working-tree changes (which a
+    history rewrite would silently discard)."""
+    dirty: List[str] = []
+    for sub in _submodule_paths(repo_root):
+        r = gc.git_status(
+            short=True, cwd=repo_root / sub, capture_output=True, check=False,
+        )
+        if r.returncode == 0 and r.stdout.strip():
+            dirty.append(sub)
+    return dirty
+
+
+def git_reinit(
+    path: Optional[StrPath] = None,
+    *,
+    main_branch: str = "main",
+    develop_branch: str = "develop",
+    initial_commit_message: str = "Initial commit",
+    remote_name: str = "origin",
+    push: bool = True,
+    prune_remote: bool = True,
+    use_force_with_lease: bool = True,
+    strict_push: bool = False,
+) -> GitReinitResult:
+    """
+    Collapse an existing repo into a single fresh commit with the main/develop
+    layout of `git-init.md`, using the current working tree and keeping the
+    existing remote.
+
+    Unlike `git_init(existing_repository="reinitialize")`, this does **not**
+    move or delete `.git`. It rewrites history in place with an orphan branch,
+    which avoids OS file-lock failures (e.g. Windows locking objects under
+    `.git/modules`) and, crucially, preserves submodule registration and
+    `.git/modules`, so submodules keep working.
+
+    - Create an orphan branch, stage the current working tree (including
+      submodule gitlinks), and commit it as one commit.
+    - Delete every other local branch, rename the orphan to `main_branch`,
+      create `develop_branch` from it, and switch to `develop_branch`.
+    - Force-push both branches and (with `prune_remote`) delete all other
+      remote branches and tags so the remote mirrors the clean state.
+
+    Parameters
+    ----------
+    path :
+        Repository root. Default: current working directory.
+    main_branch / develop_branch :
+        Branch names (must differ). `develop_branch` is branched from
+        `main_branch`, so both point at the same single commit.
+    initial_commit_message :
+        Message for the single commit; empty tree uses ``--allow-empty``.
+    remote_name :
+        Remote to overwrite (default ``origin``). Its config is left untouched.
+    push :
+        If True (default), force-push `main` and `develop` to the remote.
+    prune_remote :
+        If True (default) and the push succeeded, delete every other remote
+        branch and all remote tags.
+    use_force_with_lease :
+        If True (default), push with ``--force-with-lease`` (safe here because
+        `.git` and remote-tracking refs are preserved); otherwise plain
+        ``--force``.
+    strict_push :
+        If True and a force-push fails, raise ``GitReinitError`` instead of
+        returning with warnings.
+
+    Raises
+    ------
+    GitReinitError
+        If submodules have uncommitted changes (a rewrite would lose them),
+        or for other hard failures.
+    """
+    warnings: List[str] = []
+    repo_root = _resolve_root(path)
+
+    if main_branch == develop_branch:
+        raise GitReinitError("main_branch and develop_branch must differ")
+
+    if not _inside_git_work_tree(repo_root):
+        raise GitReinitError(
+            f"No Git repository found at {repo_root}. Use git_init for a fresh directory."
+        )
+
+    # A rewrite silently discards uncommitted submodule edits (submodules are
+    # separate repos). Refuse rather than lose them.
+    dirty = _dirty_submodules(repo_root)
+    if dirty:
+        raise GitReinitError(
+            "Refusing to run: uncommitted changes in submodule(s): "
+            + ", ".join(dirty)
+            + ". Commit and push them inside the submodule first."
+        )
+
+    # Capture remote refs before the rewrite (for pruning).
+    remote_url = _get_remote_url(repo_root, remote_name)
+    remote_heads: Optional[List[str]] = None
+    remote_tags: Optional[List[str]] = None
+    if push and remote_url is not None:
+        remote_heads = _list_remote_refs(repo_root, remote_name, "heads")
+        remote_tags = _list_remote_refs(repo_root, remote_name, "tags")
+        if remote_heads is None:
+            warnings.append(
+                f"Could not reach remote '{remote_name}' to enumerate refs; it will not be pruned."
+            )
+
+    # Orphan branch: fresh history, keeping the working tree, index, and
+    # submodule gitlinks. `.git` is never moved or deleted.
+    tmp_branch = "__git_reinit_tmp__"
+    gc.run_git(
+        "checkout", "--orphan", tmp_branch,
+        cwd=str(repo_root), check=True, capture_output=True, text=True,
+    )
+    gc.git_add(all=True, cwd=str(repo_root))
+    cr = gc.git_commit(
+        message=initial_commit_message, cwd=str(repo_root),
+        check=False, capture_output=True,
+    )
+    if cr.returncode != 0:
+        gc.git_commit(
+            message=initial_commit_message, allow_empty=True,
+            cwd=str(repo_root), check=True, capture_output=True,
+        )
+    commit_hash = _commit_hash(repo_root)
+
+    # Remove every other local branch, then name the orphan `main` and branch
+    # `develop` from it.
+    for br in _local_branches(repo_root):
+        if br == tmp_branch:
+            continue
+        gc.git_branch(
+            force_delete=br, cwd=str(repo_root), check=False, capture_output=True,
+        )
+    gc.git_branch(move=main_branch, cwd=str(repo_root), check=True, capture_output=True)
+    gc.git_branch(develop_branch, cwd=str(repo_root), check=True, capture_output=True)
+    gc.git_switch(develop_branch, cwd=str(repo_root))
+
+    pushed = False
+    deleted_branches: List[str] = []
+    deleted_tags: List[str] = []
+
+    if push and remote_url is not None:
+        push_ok = True
+        for b in (main_branch, develop_branch):
+            try:
+                gc.git_push(
+                    remote_name, b, set_upstream=True,
+                    force=not use_force_with_lease,
+                    force_with_lease=use_force_with_lease,
+                    cwd=str(repo_root), check=True, capture_output=True,
+                )
+            except subprocess.CalledProcessError as exc:
+                err = (exc.stderr or exc.stdout or "").strip()
+                w = f"Force-push of '{b}' failed (exit {exc.returncode}): {err or 'no output'}"
+                warnings.append(w)
+                push_ok = False
+                if strict_push:
+                    raise GitReinitError(w) from exc
+                break
+        pushed = push_ok
+
+        if prune_remote and pushed:
+            for br in (remote_heads or []):
+                if br in (main_branch, develop_branch):
+                    continue
+                try:
+                    gc.git_push(
+                        remote_name, br, delete=True,
+                        cwd=str(repo_root), check=True, capture_output=True,
+                    )
+                    deleted_branches.append(br)
+                except subprocess.CalledProcessError as exc:
+                    warnings.append(
+                        f"Failed to delete remote branch '{br}': "
+                        f"{(exc.stderr or exc.stdout or '').strip() or 'no output'}"
+                    )
+            for tg in (remote_tags or []):
+                try:
+                    gc.git_push(
+                        remote_name, f"refs/tags/{tg}", delete=True,
+                        cwd=str(repo_root), check=True, capture_output=True,
+                    )
+                    deleted_tags.append(tg)
+                except subprocess.CalledProcessError as exc:
+                    warnings.append(
+                        f"Failed to delete remote tag '{tg}': "
+                        f"{(exc.stderr or exc.stdout or '').strip() or 'no output'}"
+                    )
+    elif push and remote_url is None:
+        warnings.append(
+            f"Remote '{remote_name}' is not configured; rewrote history locally only."
+        )
+
+    return GitReinitResult(
+        success=True,
+        repository_root=repo_root,
+        current_branch=_current_branch(repo_root),
+        main_branch=main_branch,
+        develop_branch=develop_branch,
+        commit_hash=commit_hash,
+        remote_url=remote_url,
+        pushed=pushed,
+        deleted_remote_branches=deleted_branches,
+        deleted_remote_tags=deleted_tags,
+        warnings=warnings,
+    )
+
+
 __all__ = [
     "ExistingRepoPolicy",
     "GitCommitAndPushError",
@@ -851,9 +1134,12 @@ __all__ = [
     "GitInitResult",
     "GitMergeToMainError",
     "GitMergeToMainResult",
+    "GitReinitError",
+    "GitReinitResult",
     "GitRepositoryExistsError",
     "GitWorkflowError",
     "git_commit_and_push",
     "git_init",
     "git_merge_to_main",
+    "git_reinit",
 ]
